@@ -162,18 +162,34 @@ impl<T> Sender<T> {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Fully close the channel
+    ///
+    /// This will force close the channel even if there are outstanding `Sender`
+    /// and `Receiver` handles. Further operations on any outstanding handle
+    /// will result in a disconnected error.
+    pub fn close(&self) {
+        self.inner.close();
+    }
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
-        let mut num = self.inner.num_tx.load(Ordering::Acquire);
+        let mut num = self.inner.num_tx.load(Ordering::SeqCst);
 
         loop {
+            // Don't overflow
             if num == usize::MAX {
                 panic!();
             }
 
-            let actual = self.inner.num_tx.compare_and_swap(num, num + 1, Ordering::Relaxed);
+            // Tx half is shutdown, so no ref counting anymore. A cloned handle
+            // is still returned.
+            if num == 0 {
+                break;
+            }
+
+            let actual = self.inner.num_tx.compare_and_swap(num, num + 1, Ordering::SeqCst);
 
             if num == actual {
                 break;
@@ -188,7 +204,24 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        if 1 == self.inner.num_tx.fetch_sub(1, Ordering::Relaxed) {
+        let mut num = self.inner.num_tx.load(Ordering::SeqCst);
+
+        loop {
+            // Tx half is shutdown, no ref counting anymore.
+            if num == 0 {
+                return;
+            }
+
+            let actual = self.inner.num_tx.compare_and_swap(num, num - 1, Ordering::SeqCst);
+
+            if num == actual {
+                break;
+            }
+
+            num = actual;
+        }
+
+        if num == 1 {
             self.inner.close_tx();
         }
     }
@@ -247,18 +280,27 @@ impl<T> Receiver<T> {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Fully close the channel
+    ///
+    /// This will force close the channel even if there are outstanding `Sender`
+    /// and `Receiver` handles. Further operations on any outstanding handle
+    /// will result in a disconnected error.
+    pub fn close(&self) {
+        self.inner.close();
+    }
 }
 
 impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Receiver<T> {
-        let mut num = self.inner.num_rx.load(Ordering::Acquire);
+        let mut num = self.inner.num_rx.load(Ordering::SeqCst);
 
         loop {
             if num == usize::MAX {
                 panic!();
             }
 
-            let actual = self.inner.num_rx.compare_and_swap(num, num + 1, Ordering::Relaxed);
+            let actual = self.inner.num_rx.compare_and_swap(num, num + 1, Ordering::SeqCst);
 
             if num == actual {
                 break;
@@ -273,7 +315,24 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        if 1 == self.inner.num_rx.fetch_sub(1, Ordering::Relaxed) {
+        let mut num = self.inner.num_rx.load(Ordering::SeqCst);
+
+        loop {
+            // Rx half is shutdown, no ref counting anymore.
+            if num == 0 {
+                return;
+            }
+
+            let actual = self.inner.num_rx.compare_and_swap(num, num - 1, Ordering::SeqCst);
+
+            if num == actual {
+                break;
+            }
+
+            num = actual;
+        }
+
+        if num == 1 {
             self.inner.close_rx();
         }
     }
@@ -545,6 +604,14 @@ impl<T> Inner<T> {
         }
 
         val
+    }
+
+    fn close(&self) {
+        self.num_rx.store(0, Ordering::SeqCst);
+        self.num_tx.store(0, Ordering::SeqCst);
+
+        self.close_tx();
+        self.close_rx();
     }
 
     fn close_tx(&self) {
@@ -868,5 +935,42 @@ mod test {
         }
 
         rx.recv().unwrap_err();
+    }
+
+    #[test]
+    fn test_tx_shutdown() {
+        let (tx, rx) = channel(1024);
+
+        {
+            // Clone tx to keep a handle open
+            let tx = tx.clone();
+            thread::spawn(move || {
+                tx.send("hello").unwrap();
+                tx.close();
+            });
+        }
+
+        assert_eq!("hello", rx.recv().unwrap());
+        assert!(rx.recv().is_err());
+        assert!(tx.send("goodbye").is_err());
+    }
+
+    #[test]
+    fn test_rx_shutdown() {
+        let (tx, rx) = channel(1024);
+
+        {
+            let tx = tx.clone();
+            let rx = rx.clone();
+
+            thread::spawn(move || {
+                tx.send("hello").unwrap();
+                rx.close();
+            });
+        }
+
+        assert_eq!("hello", rx.recv().unwrap());
+        assert!(rx.recv().is_err());
+        assert!(tx.send("goodbye").is_err());
     }
 }
