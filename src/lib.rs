@@ -396,7 +396,7 @@ impl<T> Inner<T> {
     }
 
     fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
+        self.len.load(Ordering::SeqCst)
     }
 
     fn push(&self, el: T) -> Result<(), SendError<T>> {
