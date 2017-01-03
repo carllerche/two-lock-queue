@@ -67,7 +67,7 @@ pub use std::sync::mpsc::{TryRecvError, RecvError, RecvTimeoutError};
 
 use std::{mem, ops, ptr, usize};
 use std::sync::{Arc, Mutex, MutexGuard, Condvar};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The sending-half of the channel.
@@ -82,6 +82,50 @@ pub struct Sender<T> {
 /// The receiving-half of the channel.
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
+}
+
+// A variant of the "two lock queue" algorithm.  The `tail` mutex gates entry to
+// push elements, and has an associated condition for waiting pushes.  Similarly
+// for the `head` mutex.  The "len" field that they both rely on is maintained
+// as an atomic to avoid needing to get both locks in most cases. Also, to
+// minimize need for pushes to get `head` mutex and vice-versa, cascading
+// notifies are used. When a push notices that it has enabled at least one pop,
+// it signals `not_empty`. That pop in turn signals others if more items have
+// been entered since the signal. And symmetrically for pops signalling pushes.
+//
+// Visibility between producers and consumers is provided as follows:
+//
+// Whenever an element is enqueued, the `tail` lock is acquired and `len`
+// updated.  A subsequent consumer guarantees visibility to the enqueued Node by
+// acquiring the `head` lock and then reading `n = len.load(Acquire)` this gives
+// visibility to the first n items.
+struct Inner<T> {
+    // Maximum number of elements the queue can contain at one time
+    capacity: usize,
+
+    // Current number of elements
+    len: AtomicUsize,
+
+    // `true` when the channel is currently open
+    is_open: AtomicBool,
+
+    // Lock held by take, poll, etc
+    head: Mutex<NodePtr<T>>,
+
+    // Wait queue for waiting takes
+    not_empty: Condvar,
+
+    // Number of senders in existence
+    num_tx: AtomicUsize,
+
+    // Lock held by put, offer, etc
+    tail: Mutex<NodePtr<T>>,
+
+    // Wait queue for waiting puts
+    not_full: Condvar,
+
+    // Number of receivers in existence
+    num_rx: AtomicUsize,
 }
 
 /// Possible errors that `send_timeout` could encounter.
@@ -171,58 +215,33 @@ impl<T> Sender<T> {
     pub fn close(&self) {
         self.inner.close();
     }
+
+    /// Returns `true` if the channel is currently in an open state
+    pub fn is_open(&self) -> bool {
+        self.inner.is_open.load(Ordering::SeqCst)
+    }
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
-        let mut num = self.inner.num_tx.load(Ordering::SeqCst);
+        // Attempt to clone the inner handle. Doing this before incrementing
+        // `num_tx` prevents having to check `num_tx` for overflow and instead
+        // rely on `Arc::clone` to prevent the overflow.
 
-        loop {
-            // Don't overflow
-            if num == usize::MAX {
-                panic!();
-            }
+        let inner = self.inner.clone();
 
-            // Tx half is shutdown, so no ref counting anymore. A cloned handle
-            // is still returned.
-            if num == 0 {
-                break;
-            }
+        // Increment `num_tx`
+        self.inner.num_tx.fetch_add(1, Ordering::SeqCst);
 
-            let actual = self.inner.num_tx.compare_and_swap(num, num + 1, Ordering::SeqCst);
-
-            if num == actual {
-                break;
-            }
-
-            num = actual;
-        }
-
-        Sender { inner: self.inner.clone() }
+        // Return the new sender
+        Sender { inner: inner }
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        let mut num = self.inner.num_tx.load(Ordering::SeqCst);
-
-        loop {
-            // Tx half is shutdown, no ref counting anymore.
-            if num == 0 {
-                return;
-            }
-
-            let actual = self.inner.num_tx.compare_and_swap(num, num - 1, Ordering::SeqCst);
-
-            if num == actual {
-                break;
-            }
-
-            num = actual;
-        }
-
-        if num == 1 {
-            self.inner.close_tx();
+        if 1 == self.inner.num_tx.fetch_sub(1, Ordering::SeqCst) {
+            self.inner.close();
         }
     }
 }
@@ -289,94 +308,34 @@ impl<T> Receiver<T> {
     pub fn close(&self) {
         self.inner.close();
     }
+
+    /// Returns `true` if the channel is currently in an open state
+    pub fn is_open(&self) -> bool {
+        self.inner.is_open.load(Ordering::SeqCst)
+    }
 }
 
 impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Receiver<T> {
-        let mut num = self.inner.num_rx.load(Ordering::SeqCst);
+        // Attempt to clone the inner handle. Doing this before incrementing
+        // `num_rx` prevents having to check `num_rx` for overflow and instead
+        // rely on `Arc::clone` to prevent the overflow.
 
-        loop {
-            if num == usize::MAX {
-                panic!();
-            }
+        let inner = self.inner.clone();
 
-            let actual = self.inner.num_rx.compare_and_swap(num, num + 1, Ordering::SeqCst);
+        // Increment `num_rx`
+        self.inner.num_rx.fetch_add(1, Ordering::SeqCst);
 
-            if num == actual {
-                break;
-            }
-
-            num = actual;
-        }
-
-        Receiver { inner: self.inner.clone() }
+        Receiver { inner: inner }
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let mut num = self.inner.num_rx.load(Ordering::SeqCst);
-
-        loop {
-            // Rx half is shutdown, no ref counting anymore.
-            if num == 0 {
-                return;
-            }
-
-            let actual = self.inner.num_rx.compare_and_swap(num, num - 1, Ordering::SeqCst);
-
-            if num == actual {
-                break;
-            }
-
-            num = actual;
-        }
-
-        if num == 1 {
-            self.inner.close_rx();
+        if 1 == self.inner.num_rx.fetch_sub(1, Ordering::SeqCst) {
+            self.inner.close();
         }
     }
-}
-
-// A variant of the "two lock queue" algorithm.  The `tail` mutex gates entry to
-// push elements, and has an associated condition for waiting pushes.  Similarly
-// for the `head` mutex.  The "len" field that they both rely on is maintained
-// as an atomic to avoid needing to get both locks in most cases. Also, to
-// minimize need for pushes to get `head` mutex and vice-versa, cascading
-// notifies are used. When a push notices that it has enabled at least one pop,
-// it signals `not_empty`. That pop in turn signals others if more items have
-// been entered since the signal. And symmetrically for pops signalling pushes.
-//
-// Visibility between producers and consumers is provided as follows:
-//
-// Whenever an element is enqueued, the `tail` lock is acquired and `len`
-// updated.  A subsequent consumer guarantees visibility to the enqueued Node by
-// acquiring the `head` lock and then reading `n = len.load(Acquire)` this gives
-// visibility to the first n items.
-struct Inner<T> {
-    // Maximum number of elements the queue can contain at one time
-    capacity: usize,
-
-    // Current number of elements
-    len: AtomicUsize,
-
-    // Lock held by take, poll, etc
-    head: Mutex<NodePtr<T>>,
-
-    // Wait queue for waiting takes
-    not_empty: Condvar,
-
-    // Number of senders in existence
-    num_tx: AtomicUsize,
-
-    // Lock held by put, offer, etc
-    tail: Mutex<NodePtr<T>>,
-
-    // Wait queue for waiting puts
-    not_full: Condvar,
-
-    // Number of receivers in existence
-    num_rx: AtomicUsize,
 }
 
 impl<T> Inner<T> {
@@ -386,6 +345,7 @@ impl<T> Inner<T> {
         Inner {
             capacity: capacity,
             len: AtomicUsize::new(0),
+            is_open: AtomicBool::new(true),
             head: Mutex::new(head),
             not_empty: Condvar::new(),
             num_tx: AtomicUsize::new(1),
@@ -407,14 +367,14 @@ impl<T> Inner<T> {
 
         while self.len.load(Ordering::Acquire) == self.capacity {
             // Always check this before sleeping
-            if self.num_rx.load(Ordering::Relaxed) == 0 {
+            if !self.is_open.load(Ordering::Relaxed) {
                 return Err(SendError(node.into_inner()));
             }
 
             tail = self.not_full.wait(tail).ok().expect("something went wrong");
         }
 
-        if self.num_rx.load(Ordering::Relaxed) == 0 {
+        if !self.is_open.load(Ordering::Relaxed) {
             return Err(SendError(node.into_inner()));
         }
 
@@ -428,7 +388,7 @@ impl<T> Inner<T> {
         // Acquire the write lock
         let tail = self.tail.lock().ok().expect("something went wrong");
 
-        if self.num_rx.load(Ordering::Relaxed) == 0 {
+        if !self.is_open.load(Ordering::Relaxed) {
             return Err(TrySendError::Disconnected(node.into_inner()));
         }
 
@@ -455,7 +415,7 @@ impl<T> Inner<T> {
                     return Err(SendTimeoutError::Timeout(node.into_inner()));
                 }
 
-                if 0 == self.num_rx.load(Ordering::Relaxed) {
+                if !self.is_open.load(Ordering::Relaxed) {
                     return Err(SendTimeoutError::Disconnected(node.into_inner()));
                 }
 
@@ -473,7 +433,7 @@ impl<T> Inner<T> {
             }
         }
 
-        if self.num_rx.load(Ordering::Relaxed) == 0 {
+        if !self.is_open.load(Ordering::Relaxed) {
             return Err(SendTimeoutError::Disconnected(node.into_inner()));
         }
 
@@ -513,7 +473,7 @@ impl<T> Inner<T> {
 
         while self.len.load(Ordering::Acquire) == 0 {
             // Ensure that there are still senders
-            if self.num_tx.load(Ordering::Relaxed) == 0 {
+            if !self.is_open.load(Ordering::Relaxed) {
                 return Err(RecvError);
             }
 
@@ -528,7 +488,7 @@ impl<T> Inner<T> {
         let head = self.head.lock().ok().expect("something went wrong");
 
         if self.len.load(Ordering::Acquire) == 0 {
-            if self.num_tx.load(Ordering::Relaxed) == 0 {
+            if !self.is_open.load(Ordering::Relaxed) {
                 return Err(TryRecvError::Disconnected);
             } else {
                 return Err(TryRecvError::Empty);
@@ -552,7 +512,7 @@ impl<T> Inner<T> {
                 }
 
                 // Ensure that there are still senders
-                if self.num_tx.load(Ordering::Relaxed) == 0 {
+                if !self.is_open.load(Ordering::Relaxed) {
                     return Err(RecvTimeoutError::Disconnected);
                 }
 
@@ -607,24 +567,19 @@ impl<T> Inner<T> {
     }
 
     fn close(&self) {
-        self.num_rx.store(0, Ordering::SeqCst);
-        self.num_tx.store(0, Ordering::SeqCst);
-
-        self.close_tx();
-        self.close_rx();
+        if self.is_open.swap(false, Ordering::SeqCst) {
+            self.notify_tx();
+            self.notify_rx();
+        }
     }
 
-    fn close_tx(&self) {
+    fn notify_tx(&self) {
         let _lock = self.head.lock().expect("something went wrong");
-        // Wakeup all receivers. The receivers will then check num_tx and notice
-        // that it is set to 0
         self.not_empty.notify_all();
     }
 
-    fn close_rx(&self) {
+    fn notify_rx(&self) {
         let _lock = self.tail.lock().expect("something went wrong");
-        // Wakeup all senders. The senders will then check num_rx and notice
-        // that it is set to 0
         self.not_full.notify_all();
     }
 }
