@@ -662,6 +662,7 @@ unsafe impl<T> Send for NodePtr<T> {}
 mod test {
     use super::*;
     use std::thread;
+    use std::time::*;
 
     #[test]
     fn single_thread_send_recv() {
