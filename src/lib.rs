@@ -220,6 +220,24 @@ impl<T> Sender<T> {
     pub fn is_open(&self) -> bool {
         self.inner.is_open.load(Ordering::SeqCst)
     }
+
+    /// Returns the capacity of the queue
+    ///
+    /// ```
+    /// use two_lock_queue::{channel, unbounded};
+    /// # use std::usize;
+    ///
+    /// let (tx, _) = channel(1024);
+    /// assert_eq!(tx.capacity(), 1024);
+    /// # tx.try_send(0).unwrap_err();; // needed for type inference
+    ///
+    /// let (tx, _) = unbounded();
+    /// assert_eq!(tx.capacity(), usize::MAX);
+    /// # tx.try_send(0).unwrap_err(); // needed for type inference
+    /// ```
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity
+    }
 }
 
 impl<T> Clone for Sender<T> {
@@ -312,6 +330,25 @@ impl<T> Receiver<T> {
     /// Returns `true` if the channel is currently in an open state
     pub fn is_open(&self) -> bool {
         self.inner.is_open.load(Ordering::SeqCst)
+    }
+
+    /// Returns the capacity of the queue
+    ///
+    /// ```
+    /// use two_lock_queue::{channel, unbounded};
+    /// # use two_lock_queue::TryRecvError;
+    /// # use std::usize;
+    ///
+    /// let (_, rx) = channel(1024);
+    /// assert_eq!(rx.capacity(), 1024);
+    /// # let _: Result<u8, TryRecvError> = rx.try_recv(); // needed for type inference
+    ///
+    /// let (_, rx) = unbounded();
+    /// assert_eq!(rx.capacity(), usize::MAX);
+    /// # let _: Result<u8, TryRecvError> = rx.try_recv(); // needed for type inference
+    /// ```
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity
     }
 }
 
