@@ -693,7 +693,7 @@ impl<T> Clone for NodePtr<T> {
 }
 
 impl<T> Copy for NodePtr<T> {}
-unsafe impl<T> Send for NodePtr<T> {}
+unsafe impl<T> Send for NodePtr<T> where T: Send {}
 
 #[cfg(test)]
 mod test {
